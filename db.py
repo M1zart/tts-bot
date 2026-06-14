@@ -17,14 +17,13 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         conn.execute(
-            """
+            f"""
             CREATE TABLE IF NOT EXISTS user_settings (
                 user_id INTEGER PRIMARY KEY,
-                voice_key TEXT NOT NULL DEFAULT ?,
-                speed REAL NOT NULL DEFAULT ?
+                voice_key TEXT NOT NULL DEFAULT '{DEFAULT_VOICE_KEY}',
+                speed REAL NOT NULL DEFAULT {DEFAULT_SPEED}
             )
-            """,
-            (DEFAULT_VOICE_KEY, DEFAULT_SPEED),
+            """
         )
 
 
@@ -45,7 +44,7 @@ def get_user_settings(user_id: int) -> dict:
 
 
 def set_user_voice(user_id: int, voice_key: str):
-    get_user_settings(user_id)  # гарантирует существование строки
+    get_user_settings(user_id)
     with get_conn() as conn:
         conn.execute(
             "UPDATE user_settings SET voice_key = ? WHERE user_id = ?",
