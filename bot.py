@@ -1,7 +1,7 @@
 import logging
 import io
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -130,10 +130,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await status_msg.delete()
 
 
+async def post_init(application):
+    await application.bot.set_my_commands([
+        BotCommand("start", "Начало работы"),
+        BotCommand("voice", "Выбрать голос"),
+        BotCommand("speed", "Настроить скорость"),
+        BotCommand("settings", "Текущие настройки"),
+    ])
+
+
 def main():
     init_db()
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("settings", settings_cmd))
