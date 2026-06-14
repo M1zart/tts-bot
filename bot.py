@@ -1,6 +1,8 @@
 import logging
 import io
+import asyncio
 
+from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     ApplicationBuilder,
@@ -16,6 +18,9 @@ from config import (
     AVAILABLE_VOICES,
     MIN_SPEED,
     MAX_SPEED,
+    API_SECRET,
+    PORT,
+    OWNER_CHAT_ID,
 )
 from db import init_db, get_user_settings, set_user_voice, set_user_speed
 from tts.google_tts import synthesize_text
@@ -101,33 +106,86 @@ async def speed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Скорость установлена: {speed}x")
 
 
+async def synthesize_and_send(bot, chat_id: int, text: str, user_id: int):
+    """Синтезирует текст в аудио и отправляет в указанный чат."""
+    settings = get_user_settings(user_id)
+
+    audio_bytes = await synthesize_text(
+        text=text,
+        voice_key=settings["voice_key"],
+        speed=settings["speed"],
+    )
+
+    audio_file = io.BytesIO(audio_bytes)
+    audio_file.name = "speech.mp3"
+
+    await bot.send_audio(chat_id=chat_id, audio=audio_file)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     text = update.message.text
 
     if not text or not text.strip():
         return
 
-    settings = get_user_settings(user_id)
-
     status_msg = await update.message.reply_text("Озвучиваю...")
 
     try:
-        audio_bytes = await synthesize_text(
-            text=text,
-            voice_key=settings["voice_key"],
-            speed=settings["speed"],
-        )
+        await synthesize_and_send(context.bot, chat_id, text, user_id)
     except Exception as e:
         logger.exception("TTS synthesis failed")
         await status_msg.edit_text(f"Ошибка при озвучке: {e}")
         return
 
-    audio_file = io.BytesIO(audio_bytes)
-    audio_file.name = "speech.mp3"
-
-    await update.message.reply_audio(audio=audio_file)
     await status_msg.delete()
+
+
+async def handle_speak_request(request: web.Request) -> web.Response:
+    """HTTP-эндпоинт для браузерного расширения: POST /speak"""
+    if not API_SECRET:
+        return web.json_response({"ok": False, "error": "API_SECRET not configured"}, status=500)
+
+    auth_header = request.headers.get("Authorization", "")
+    expected = f"Bearer {API_SECRET}"
+    if auth_header != expected:
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    if not OWNER_CHAT_ID:
+        return web.json_response({"ok": False, "error": "OWNER_CHAT_ID not configured"}, status=500)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    text = data.get("text", "").strip()
+    if not text:
+        return web.json_response({"ok": False, "error": "empty text"}, status=400)
+
+    bot = request.app["bot"]
+    chat_id = int(OWNER_CHAT_ID)
+
+    try:
+        await synthesize_and_send(bot, chat_id, text, chat_id)
+    except Exception as e:
+        logger.exception("HTTP TTS synthesis failed")
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    return web.json_response({"ok": True})
+
+
+async def run_web_server(bot):
+    app = web.Application()
+    app["bot"] = bot
+    app.router.add_post("/speak", handle_speak_request)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"HTTP server started on port {PORT}")
 
 
 async def post_init(application):
@@ -139,7 +197,7 @@ async def post_init(application):
     ])
 
 
-def main():
+async def run_bot():
     init_db()
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
@@ -152,7 +210,19 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Bot starting...")
-    app.run_polling()
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+
+    await run_web_server(app.bot)
+
+    # Держим процесс живым
+    await asyncio.Event().wait()
+
+
+def main():
+    asyncio.run(run_bot())
 
 
 if __name__ == "__main__":

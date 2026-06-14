@@ -10,6 +10,15 @@ MAX_CHUNK_CHARS = 1500
 
 DB_PATH = os.environ.get("DB_PATH", "user_settings.db")
 
+# Секретный ключ для HTTP API расширения — защита от посторонних запросов
+API_SECRET = os.environ.get("API_SECRET", "")
+
+# Порт для HTTP сервера (Railway передаёт PORT автоматически)
+PORT = int(os.environ.get("PORT", "8080"))
+
+# Telegram chat_id владельца — куда отправлять аудио из HTTP API
+OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID", "")
+
 # Доступные голоса (русские, бесплатный тир: Standard и Wavenet)
 AVAILABLE_VOICES = {
     "wavenet_d": {"name": "ru-RU-Wavenet-D", "label": "Wavenet D (муж.)"},
