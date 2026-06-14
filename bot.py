@@ -176,10 +176,63 @@ async def handle_speak_request(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def handle_speak_audio_request(request: web.Request) -> web.Response:
+    """HTTP-эндпоинт для браузерного расширения: POST /speak_audio
+    Возвращает MP3-аудио напрямую в ответе, без отправки в Telegram."""
+    if not API_SECRET:
+        return web.json_response({"ok": False, "error": "API_SECRET not configured"}, status=500)
+
+    auth_header = request.headers.get("Authorization", "")
+    expected = f"Bearer {API_SECRET}"
+    if auth_header != expected:
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    text = data.get("text", "").strip()
+    if not text:
+        return web.json_response({"ok": False, "error": "empty text"}, status=400)
+
+    # Используем настройки владельца (если OWNER_CHAT_ID задан), иначе дефолтные
+    user_id = int(OWNER_CHAT_ID) if OWNER_CHAT_ID else 0
+    settings = get_user_settings(user_id)
+
+    try:
+        audio_bytes = await synthesize_text(
+            text=text,
+            voice_key=settings["voice_key"],
+            speed=settings["speed"],
+        )
+    except Exception as e:
+        logger.exception("HTTP TTS synthesis (audio) failed")
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    return web.Response(
+        body=audio_bytes,
+        content_type="audio/mpeg",
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+
+async def handle_options(request: web.Request) -> web.Response:
+    return web.Response(
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        }
+    )
+
+
 async def run_web_server(bot):
     app = web.Application()
     app["bot"] = bot
     app.router.add_post("/speak", handle_speak_request)
+    app.router.add_post("/speak_audio", handle_speak_audio_request)
+    app.router.add_options("/speak_audio", handle_options)
 
     runner = web.AppRunner(app)
     await runner.setup()
