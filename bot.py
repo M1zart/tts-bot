@@ -25,6 +25,8 @@ from config import (
 from db import init_db, get_user_settings, set_user_voice, set_user_speed
 from tts.google_tts import synthesize_text
 from stt.gemini_stt import transcribe, TranscribeError
+from stt.text import split_for_telegram
+import voices
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -36,7 +38,8 @@ logger = logging.getLogger(__name__)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Пришли или перешли мне текст, и я озвучу его голосом. "
-        "Пришли голосовое или аудио, и я верну расшифровку текстом.\n\n"
+        "Пришли голосовое или аудио, и я верну расшифровку текстом. "
+        "Пересланные голосовые уйдут в рубрику «100 голосов».\n\n"
         "Команды:\n"
         "/voice — выбрать голос\n"
         "/speed 1.2 — настроить скорость (от 0.5 до 2.0)\n"
@@ -79,6 +82,13 @@ async def voice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         f"Голос установлен: {AVAILABLE_VOICES[voice_key]['label']}"
     )
+
+
+async def voices_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await update.callback_query.answer("Нет доступа")
+        return
+    await voices.handle_callback(update, context)
 
 
 async def speed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -132,6 +142,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text or not text.strip():
         return
 
+    if is_owner(update) and await voices.handle_session_text(update, context):
+        return
+
     status_msg = await update.message.reply_text("Озвучиваю...")
 
     try:
@@ -144,21 +157,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await status_msg.delete()
 
 
-TG_MESSAGE_LIMIT = 4000
-
-
-def split_for_telegram(text: str, limit: int = TG_MESSAGE_LIMIT):
-    """Режет длинную расшифровку на сообщения, стараясь резать по абзацам и предложениям."""
-    parts = []
-    while len(text) > limit:
-        cut = max(text.rfind("\n", 0, limit), text.rfind(". ", 0, limit) + 1, text.rfind(" ", 0, limit))
-        if cut <= 0:
-            cut = limit
-        parts.append(text[:cut].strip())
-        text = text[cut:].strip()
-    if text:
-        parts.append(text)
-    return parts
+def is_owner(update: Update) -> bool:
+    """Расшифровка и рубрика голосов только для владельца: иначе чужие голосовые тратят квоту Gemini."""
+    return not OWNER_CHAT_ID or str(update.effective_user.id) == str(OWNER_CHAT_ID)
 
 
 def pick_media(message):
@@ -180,6 +181,15 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if media is None:
         return
     file_id, mime = media
+
+    if not is_owner(update):
+        await update.message.reply_text("Расшифровка доступна только владельцу бота.")
+        return
+
+    # Пересланное голосовое: рубрика «100 голосов». Свое голосовое: просто расшифровка
+    if update.message.forward_origin is not None and voices.configured():
+        await voices.intake(update, context, file_id, mime)
+        return
 
     status_msg = await update.message.reply_text("Расшифровываю...")
     try:
@@ -318,6 +328,7 @@ async def run_bot():
     app.add_handler(CommandHandler("voice", voice_cmd))
     app.add_handler(CommandHandler("speed", speed_cmd))
     app.add_handler(CallbackQueryHandler(voice_callback, pattern=r"^voice:"))
+    app.add_handler(CallbackQueryHandler(voices_callback, pattern=r"^vo:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(
         filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE | filters.Document.AUDIO,

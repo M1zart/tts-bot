@@ -9,6 +9,10 @@ GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_TRANSCRIBE_MODEL = os.environ.get("GEMINI_TRANSCRIBE_MODEL", "gemini-3.8-flash")
 
+# Рубрика «100 голосов»: сервис PostBot (адрес без / в конце) и общий секрет его закрытого API
+POSTBOT_URL = os.environ.get("POSTBOT_URL", "")
+VOICE_API_SECRET = os.environ.get("VOICE_API_SECRET", "")
+
 # Лимит символов на один TTS-запрос для Google Cloud TTS (безопасный запас от лимита 5000 байт)
 MAX_CHUNK_CHARS = 1500
 
