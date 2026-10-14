@@ -5,6 +5,10 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 # Google credentials передаются как JSON-строка в переменной окружения
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
+# Расшифровка голосовых через Gemini
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_TRANSCRIBE_MODEL = os.environ.get("GEMINI_TRANSCRIBE_MODEL", "gemini-3.8-flash")
+
 # Лимит символов на один TTS-запрос для Google Cloud TTS (безопасный запас от лимита 5000 байт)
 MAX_CHUNK_CHARS = 1500
 

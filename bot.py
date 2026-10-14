@@ -24,6 +24,7 @@ from config import (
 )
 from db import init_db, get_user_settings, set_user_voice, set_user_speed
 from tts.google_tts import synthesize_text
+from stt.gemini_stt import transcribe, TranscribeError
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -34,7 +35,8 @@ logger = logging.getLogger(__name__)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Пришли или перешли мне любой текст — озвучу голосом.\n\n"
+        "Привет! Пришли или перешли мне текст, и я озвучу его голосом. "
+        "Пришли голосовое или аудио, и я верну расшифровку текстом.\n\n"
         "Команды:\n"
         "/voice — выбрать голос\n"
         "/speed 1.2 — настроить скорость (от 0.5 до 2.0)\n"
@@ -140,6 +142,62 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await status_msg.delete()
+
+
+TG_MESSAGE_LIMIT = 4000
+
+
+def split_for_telegram(text: str, limit: int = TG_MESSAGE_LIMIT):
+    """Режет длинную расшифровку на сообщения, стараясь резать по абзацам и предложениям."""
+    parts = []
+    while len(text) > limit:
+        cut = max(text.rfind("\n", 0, limit), text.rfind(". ", 0, limit) + 1, text.rfind(" ", 0, limit))
+        if cut <= 0:
+            cut = limit
+        parts.append(text[:cut].strip())
+        text = text[cut:].strip()
+    if text:
+        parts.append(text)
+    return parts
+
+
+def pick_media(message):
+    """Возвращает (file_id, mime) для голосового, аудио, кружка или аудиофайла, иначе None."""
+    if message.voice:
+        return message.voice.file_id, message.voice.mime_type or "audio/ogg"
+    if message.audio:
+        return message.audio.file_id, message.audio.mime_type or "audio/mpeg"
+    if message.video_note:
+        return message.video_note.file_id, "video/mp4"
+    doc = message.document
+    if doc and (doc.mime_type or "").startswith("audio/"):
+        return doc.file_id, doc.mime_type
+    return None
+
+
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    media = pick_media(update.message)
+    if media is None:
+        return
+    file_id, mime = media
+
+    status_msg = await update.message.reply_text("Расшифровываю...")
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        audio = bytes(await tg_file.download_as_bytearray())
+        text = await transcribe(audio, mime)
+    except TranscribeError as e:
+        await status_msg.edit_text(str(e))
+        return
+    except Exception as e:
+        logger.exception("Transcription failed")
+        await status_msg.edit_text(f"Ошибка при расшифровке: {e}")
+        return
+
+    parts = split_for_telegram(text)
+    await status_msg.edit_text(parts[0])
+    for part in parts[1:]:
+        await update.message.reply_text(part)
 
 
 async def handle_speak_request(request: web.Request) -> web.Response:
@@ -261,6 +319,10 @@ async def run_bot():
     app.add_handler(CommandHandler("speed", speed_cmd))
     app.add_handler(CallbackQueryHandler(voice_callback, pattern=r"^voice:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(
+        filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE | filters.Document.AUDIO,
+        handle_audio,
+    ))
 
     logger.info("Bot starting...")
 
