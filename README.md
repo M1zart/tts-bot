@@ -30,6 +30,7 @@
 - `GEMINI_TRANSCRIBE_MODEL` — модель (опционально, по умолчанию `gemini-3.8-flash`)
 - `POSTBOT_URL` — адрес сервиса PostBot без слеша в конце
 - `VOICE_API_SECRET` — общий секрет закрытого API PostBot (то же значение в обоих сервисах)
+- `GEMINI_FALLBACK_MODELS` — запасные модели через запятую (по умолчанию `gemini-3.6-flash,gemini-3.5-flash-lite`): бот переходит на них, если основная перегружена
 - `DB_PATH` — путь к SQLite файлу (опционально, по умолчанию `user_settings.db`)
 
 ## Важно про FFmpeg

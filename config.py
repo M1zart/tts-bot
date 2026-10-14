@@ -8,6 +8,12 @@ GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 # Расшифровка голосовых через Gemini
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_TRANSCRIBE_MODEL = os.environ.get("GEMINI_TRANSCRIBE_MODEL", "gemini-3.8-flash")
+# Запасные модели через запятую: на них бот переключается, если основная перегружена (503) или упирается в лимит (429)
+GEMINI_FALLBACK_MODELS = [
+    m.strip()
+    for m in os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-3.6-flash,gemini-3.5-flash-lite").split(",")
+    if m.strip()
+]
 
 # Рубрика «100 голосов»: сервис PostBot (адрес без / в конце) и общий секрет его закрытого API
 POSTBOT_URL = os.environ.get("POSTBOT_URL", "")
