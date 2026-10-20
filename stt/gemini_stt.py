@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import logging
+import time
 
 import aiohttp
 
@@ -35,6 +36,12 @@ def normalize_mime(mime: str) -> str:
     return mime or "audio/ogg"
 
 
+COOLDOWN_SECONDS = 90
+ROUNDS = 2
+ROUND_PAUSE = 5
+_COOLDOWN: dict[str, float] = {}
+
+
 async def transcribe(audio: bytes, mime: str) -> str:
     if not GEMINI_API_KEY:
         raise TranscribeError("GEMINI_API_KEY не задан в переменных Railway")
@@ -53,12 +60,14 @@ async def transcribe(audio: bytes, mime: str) -> str:
     headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
 
     models = [GEMINI_TRANSCRIBE_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_TRANSCRIBE_MODEL]
-    ATTEMPTS_PER_MODEL = 3
     last = "неизвестная ошибка"
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session:
-        for model in models:
-            url = API_URL.format(model=model)
-            for attempt in range(ATTEMPTS_PER_MODEL):
+        for round_no in range(ROUNDS):
+            now = time.monotonic()
+            # модели, которые только что упали, пропускаем; если упали все, пробуем все
+            active = [m for m in models if _COOLDOWN.get(m, 0) <= now] or models
+            for model in active:
+                url = API_URL.format(model=model)
                 async with session.post(url, json=body, headers=headers) as resp:
                     data = await resp.json(content_type=None)
                     if resp.status == 200:
@@ -73,12 +82,10 @@ async def transcribe(audio: bytes, mime: str) -> str:
                         msg = ((data or {}).get("error") or {}).get("message", "")
                         last = f"{model}: HTTP {resp.status}: {msg[:200]}"
                         logger.warning("Gemini %s", last)
-                        # Перегрузка и лимиты временные: повтор, затем следующая модель.
-                        # Остальные 4xx (ключ, формат, нет доступа к модели): повтор не поможет, пробуем следующую
-                        if resp.status not in (408, 429) and resp.status < 500:
-                            break
-                # пауза растет: 3, 6 секунд; после последней попытки сразу следующая модель
-                if attempt < ATTEMPTS_PER_MODEL - 1:
-                    await asyncio.sleep(3 * (attempt + 1))
+                        # перегрузка и лимиты: сразу следующая модель, упавшую не трогаем COOLDOWN_SECONDS
+                        if resp.status in (408, 429) or resp.status >= 500:
+                            _COOLDOWN[model] = time.monotonic() + COOLDOWN_SECONDS
+            if round_no < ROUNDS - 1:
+                await asyncio.sleep(ROUND_PAUSE)
     logger.error("Gemini transcribe failed: %s", last)
     raise TranscribeError(f"Gemini не расшифровал аудио: {last}")
