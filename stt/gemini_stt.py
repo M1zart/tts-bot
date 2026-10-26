@@ -61,30 +61,35 @@ async def transcribe(audio: bytes, mime: str) -> str:
 
     models = [GEMINI_TRANSCRIBE_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_TRANSCRIBE_MODEL]
     last = "неизвестная ошибка"
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session:
+    async with aiohttp.ClientSession() as session:
         for round_no in range(ROUNDS):
             now = time.monotonic()
             # модели, которые только что упали, пропускаем; если упали все, пробуем все
             active = [m for m in models if _COOLDOWN.get(m, 0) <= now] or models
             for model in active:
                 url = API_URL.format(model=model)
-                async with session.post(url, json=body, headers=headers) as resp:
-                    data = await resp.json(content_type=None)
-                    if resp.status == 200:
-                        parts = (((data.get("candidates") or [{}])[0]).get("content") or {}).get("parts") or []
-                        text = "".join(p.get("text", "") for p in parts).strip()
-                        if text:
-                            if model != GEMINI_TRANSCRIBE_MODEL:
-                                logger.info("Transcribed with fallback model %s", model)
-                            return text
-                        last = f"{model}: пустой ответ"
-                    else:
-                        msg = ((data or {}).get("error") or {}).get("message", "")
-                        last = f"{model}: HTTP {resp.status}: {msg[:200]}"
-                        logger.warning("Gemini %s", last)
-                        # перегрузка и лимиты: сразу следующая модель, упавшую не трогаем COOLDOWN_SECONDS
-                        if resp.status in (408, 429) or resp.status >= 500:
-                            _COOLDOWN[model] = time.monotonic() + COOLDOWN_SECONDS
+                try:
+                    async with session.post(url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                        data = await resp.json(content_type=None)
+                        if resp.status == 200:
+                            parts = (((data.get("candidates") or [{}])[0]).get("content") or {}).get("parts") or []
+                            text = "".join(p.get("text", "") for p in parts).strip()
+                            if text:
+                                if model != GEMINI_TRANSCRIBE_MODEL:
+                                    logger.info("Transcribed with fallback model %s", model)
+                                return text
+                            last = f"{model}: пустой ответ"
+                        else:
+                            msg = ((data or {}).get("error") or {}).get("message", "")
+                            last = f"{model}: HTTP {resp.status}: {msg[:200]}"
+                            logger.warning("Gemini %s", last)
+                            # перегрузка и лимиты: сразу следующая модель, упавшую не трогаем COOLDOWN_SECONDS
+                            if resp.status in (408, 429) or resp.status >= 500:
+                                _COOLDOWN[model] = time.monotonic() + COOLDOWN_SECONDS
+                except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                    last = f"{model}: {type(e).__name__} {e}".strip()
+                    logger.warning("Gemini %s", last)
+                    _COOLDOWN[model] = time.monotonic() + COOLDOWN_SECONDS
             if round_no < ROUNDS - 1:
                 await asyncio.sleep(ROUND_PAUSE)
     logger.error("Gemini transcribe failed: %s", last)

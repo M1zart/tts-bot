@@ -2,6 +2,7 @@
 раскладка по вопросам и запись в Notion делает сервис PostBot через закрытый API."""
 import asyncio
 import logging
+import re
 
 import aiohttp
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -49,7 +50,7 @@ async def download(bot, file_id: str) -> bytes:
 
 
 async def intake(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, mime: str):
-    """Пересланное голосовое: собираем пачку, через 1.5 с задаем вопрос про роль."""
+    """Пересланное голосовое: собираем пачку, через 1.5 с просим написать роль и стаж."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     s = sessions.get(user_id)
@@ -62,7 +63,7 @@ async def intake(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: st
         )
         return
     if not s:
-        s = {"chat_id": chat_id, "voices": [], "step": "role", "role": None, "number": None,
+        s = {"chat_id": chat_id, "voices": [], "step": "role", "role": None, "role_title": "", "number": None,
              "exp": "", "other_qs": [], "busy": False, "task": None, "info": None}
         sessions[user_id] = s
     s["voices"].append((file_id, mime))
@@ -71,91 +72,164 @@ async def intake(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: st
     s["task"] = context.application.create_task(announce(context.bot, s))
 
 
+def err_text(e: Exception) -> str:
+    """У таймаутов и обрывов связи текст ошибки пустой: показываем хотя бы тип."""
+    msg = str(e).strip()
+    return f"{type(e).__name__}: {msg}" if msg else type(e).__name__
+
+
+def select_name(title: str) -> str:
+    """Notion не принимает запятые в названиях select: так же считает PostBot."""
+    return " ".join((title or "").replace(",", " ").split())
+
+
+EXP_RE = re.compile(
+    r"((?:более|больше|свыше|over|more than)?\s*\d+\s*\+?\s*(?:лет|года|год|годов|years?|yrs?)\b[^,;\n]*)", re.I)
+NUM_RE = re.compile(r"[#№]\s*(\d{1,4})")
+
+
+def parse_hero(text: str):
+    """Из одной строки вида «Head of Risk, 12 лет» достает роль, стаж и необязательный номер (#7 или №7)."""
+    text = (text or "").strip()
+    number = None
+    m = NUM_RE.search(text)
+    if m:
+        number = int(m.group(1))
+        text = (text[:m.start()] + " " + text[m.end():]).strip()
+    exp = ""
+    m = EXP_RE.search(text)
+    if m:
+        exp = m.group(1).strip(" .,-—–")
+        text = (text[:m.start()] + " " + text[m.end():])
+    role = re.sub(r"\s+", " ", text).strip(" ,;-—–.\n")
+    role = re.sub(r"\b(стаж|опыт)\s*[:\-]?$", "", role, flags=re.I).strip(" ,;-—–.")
+    return role, exp[:80], number
+
+
+def match_roles(role_text: str, roles: list) -> list:
+    low = (role_text or "").lower()
+    exact = [r for r in roles if low == r["title"].lower()]
+    if exact:
+        return exact
+    out = []
+    for r in roles:
+        keys = [a.lower() for a in r.get("aliases", [])] + [r["title"].lower()]
+        if any(k and k in low for k in keys):
+            out.append(r)
+    return out
+
+
+def nth(n: int) -> str:
+    return f"{n}-й"
+
+
 async def announce(bot, s):
     try:
         await asyncio.sleep(1.5)
         if s["step"] == "role":
-            info = await api("GET", "info", timeout=30)
-            s["info"] = info
-            rows = [[InlineKeyboardButton(r["title"], callback_data="vo:r:" + r["key"])] for r in info["roles"]]
-            rows.append([InlineKeyboardButton(info.get("other", "Другое"), callback_data="vo:r:other")])
-            rows.append([InlineKeyboardButton("Только расшифровка", callback_data="vo:r:plain")])
-            rows.append([CANCEL_BTN])
-            await bot.send_message(s["chat_id"], f"Принял {len(s['voices'])} {word(len(s['voices']))}. Чей голос?",
-                                   reply_markup=kb(rows))
-        else:
+            s["info"] = await api("GET", "info", timeout=30)
+            await bot.send_message(
+                s["chat_id"],
+                f"Принял {len(s['voices'])} {word(len(s['voices']))}. Напиши, чей голос: роль и стаж одним сообщением, "
+                f"например «Head of Risk, 12 лет». Номер бот поставит сам, если нужен другой, допиши «№7».",
+                reply_markup=kb([[InlineKeyboardButton("Только расшифровка", callback_data="vo:r:plain")], [CANCEL_BTN]]),
+            )
+        elif s["step"] == "ready":
             await bot.send_message(s["chat_id"], f"Добавил. Всего голосовых: {len(s['voices'])}.",
                                    reply_markup=kb([[DONE_BTN, CANCEL_BTN]]))
+        else:
+            await bot.send_message(s["chat_id"], f"Добавил. Всего голосовых: {len(s['voices'])}.")
     except asyncio.CancelledError:
         raise
     except Exception as e:
         logger.exception("voice announce failed")
-        await bot.send_message(s["chat_id"], f"Не получилось связаться с PostBot: {e}")
-
-
-async def ask_number(bot, s):
-    s["step"] = "number"
-    nxt = (s.get("info") or {}).get("next", 1)
-    await bot.send_message(
-        s["chat_id"], "Номер голоса? Нажми кнопку или напиши число.",
-        reply_markup=kb([[InlineKeyboardButton(f"Голос #{nxt}", callback_data=f"vo:n:{nxt}")], [CANCEL_BTN]]),
-    )
-
-
-async def ask_exp(bot, s):
-    s["step"] = "exp"
-    await bot.send_message(
-        s["chat_id"], "Стаж героя? Напиши текстом (например, «12 лет в индустрии») или пропусти.",
-        reply_markup=kb([[InlineKeyboardButton("Пропустить", callback_data="vo:skip")], [CANCEL_BTN]]),
-    )
+        await bot.send_message(s["chat_id"], f"Не получилось связаться с PostBot: {err_text(e)}")
 
 
 def role_title(s) -> str:
-    if s["role"] == "other":
-        return (s.get("info") or {}).get("other", "Другое")
-    for r in (s.get("info") or {}).get("roles", []):
-        if r["key"] == s["role"]:
-            return r["title"]
-    return s["role"] or ""
+    return s.get("role_title") or ""
+
+
+def role_count(s) -> int:
+    """Сколько голосов этой роли уже есть в Notion."""
+    counts = (s.get("info") or {}).get("counts") or {}
+    return int(counts.get(select_name(role_title(s)), 0))
 
 
 async def ask_ready(bot, s):
     s["step"] = "ready"
+    if s["number"] is None:
+        s["number"] = int((s.get("info") or {}).get("next", 1))
     exp = f", {s['exp']}" if s["exp"] else ""
+    k = role_count(s) + 1
+    note = "Первый голос этой роли." if k == 1 else f"Это {nth(k)} голос этой роли, до него уже {k - 1}."
     await bot.send_message(
         s["chat_id"],
-        f"Голос #{s['number']}: {role_title(s)}{exp}\nГолосовых: {len(s['voices'])}. "
-        f"Можно досылать еще. Нажми «Готово», когда все.",
+        f"Голос #{s['number']}: {role_title(s)}{exp}\n{note}\nГолосовых: {len(s['voices'])}. "
+        f"Можно досылать еще. Если что-то не так, напиши роль и стаж заново. Нажми «Готово», когда все.",
         reply_markup=kb([[DONE_BTN, CANCEL_BTN]]),
     )
 
 
+async def after_role(bot, s):
+    """Роль определена: для известной роли сразу к подтверждению, для новой просим вопросы."""
+    if s["role"] == "other":
+        s["step"] = "otherq"
+        need = int((s.get("info") or {}).get("roleQuestions", 3))
+        await bot.send_message(
+            s["chat_id"],
+            f"Такой роли нет в списке: «{role_title(s)}». Пришли {need} вопроса для нее одним сообщением, "
+            f"каждый с новой строки. Первые два общих вопроса добавятся сами.",
+            reply_markup=kb([[CANCEL_BTN]]),
+        )
+        return
+    await ask_ready(bot, s)
+
+
 async def handle_session_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Текст в чате, пока открыта сессия: номер, стаж или вопросы для роли «Другое». True = текст использован."""
+    """Текст в чате, пока открыта сессия: роль и стаж или вопросы для новой роли. True = текст использован."""
     s = sessions.get(update.effective_user.id)
-    if not s or s["busy"] or s["step"] not in ("number", "exp", "otherq"):
+    if not s or s["busy"] or s["step"] not in ("role", "ready", "pick", "otherq"):
         return False
     text = (update.message.text or "").strip()
     bot = context.bot
-    if s["step"] == "number":
-        if not text.isdigit() or len(text) > 4:
-            await update.message.reply_text("Нужно число, например 7.")
+    if s["step"] == "otherq":
+        need = int((s.get("info") or {}).get("roleQuestions", 3))
+        qs = [q.strip().lstrip("0123456789.) ").strip() for q in text.split("\n")]
+        qs = [q for q in qs if q]
+        if len(qs) != need:
+            await update.message.reply_text(f"Нужно ровно {need} вопроса, каждый с новой строки.")
             return True
-        s["number"] = int(text)
-        await ask_exp(bot, s)
-        return True
-    if s["step"] == "exp":
-        s["exp"] = text[:80]
+        s["other_qs"] = qs
         await ask_ready(bot, s)
         return True
-    need = int((s.get("info") or {}).get("roleQuestions", 3))
-    qs = [q.strip().lstrip("0123456789.) ").strip() for q in text.split("\n")]
-    qs = [q for q in qs if q]
-    if len(qs) != need:
-        await update.message.reply_text(f"Нужно ровно {need} вопроса, каждый с новой строки.")
+    # role / ready / pick: считаем, что человек пишет роль и стаж (заново тоже можно)
+    if not s.get("info"):
+        try:
+            s["info"] = await api("GET", "info", timeout=30)
+        except Exception as e:
+            await update.message.reply_text(f"Не получилось связаться с PostBot: {err_text(e)}")
+            return True
+    role_text, exp, number = parse_hero(text)
+    if not role_text:
+        await update.message.reply_text("Не вижу роли. Напиши, например: Head of Risk, 12 лет.")
         return True
-    s["other_qs"] = qs
-    await ask_number(bot, s)
+    s["exp"] = exp
+    s["number"] = number
+    s["other_qs"] = []
+    roles = (s.get("info") or {}).get("roles", [])
+    found = match_roles(role_text, roles)
+    if len(found) == 1:
+        s["role"], s["role_title"] = found[0]["key"], found[0]["title"]
+        await after_role(bot, s)
+    elif len(found) > 1:
+        s["step"] = "pick"
+        rows = [[InlineKeyboardButton(r["title"], callback_data="vo:r:" + r["key"])] for r in found]
+        rows.append([CANCEL_BTN])
+        await bot.send_message(s["chat_id"], "Подходит несколько ролей, какая?", reply_markup=kb(rows))
+    else:
+        s["role"], s["role_title"] = "other", role_text[:60]
+        await after_role(bot, s)
     return True
 
 
@@ -181,32 +255,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sessions.pop(user_id, None)
         await bot.send_message(s["chat_id"], "Отменено, голосовые не сохранены.")
         return
-    if kind == "r" and s["step"] == "role":
-        if arg == "plain":
-            await process_plain(bot, user_id, s)
-            return
-        s["role"] = arg
-        if arg == "other":
-            s["step"] = "otherq"
-            need = int((s.get("info") or {}).get("roleQuestions", 3))
-            await bot.send_message(
-                s["chat_id"], f"Пришли {need} вопроса для этого героя одним сообщением, каждый с новой строки.",
-                reply_markup=kb([[CANCEL_BTN]]),
-            )
-            return
-        await ask_number(bot, s)
+    if kind == "r" and arg == "plain" and s["step"] in ("role", "pick"):
+        await process_plain(bot, user_id, s)
         return
-    if kind == "n" and s["step"] == "number":
-        s["number"] = int(arg)
-        await ask_exp(bot, s)
-        return
-    if kind == "skip" and s["step"] == "exp":
-        s["exp"] = ""
-        await ask_ready(bot, s)
+    if kind == "r" and s["step"] == "pick":
+        for r in (s.get("info") or {}).get("roles", []):
+            if r["key"] == arg:
+                s["role"], s["role_title"] = r["key"], r["title"]
+                await after_role(bot, s)
+                return
         return
     if kind == "go":
         if s["step"] != "ready":
-            await bot.send_message(s["chat_id"], "Сначала выбери роль, номер и стаж.")
+            await bot.send_message(s["chat_id"], "Сначала напиши роль и стаж героя.")
             return
         await process(bot, user_id, s)
 
@@ -235,12 +296,12 @@ async def process_plain(bot, user_id, s):
         sessions.pop(user_id, None)
     except (TranscribeError, RuntimeError) as e:
         s["busy"] = False
-        await bot.send_message(s["chat_id"], f"Не получилось: {e}\n\nСессия сохранена, выбери роль заново.",
-                               reply_markup=kb([[CANCEL_BTN]]))
+        await bot.send_message(s["chat_id"], f"Не получилось: {err_text(e)}\n\nСессия сохранена, нажми «Только расшифровка» еще раз.",
+                               reply_markup=kb([[InlineKeyboardButton("Только расшифровка", callback_data="vo:r:plain")], [CANCEL_BTN]]))
     except Exception as e:
         s["busy"] = False
         logger.exception("plain transcribe failed")
-        await bot.send_message(s["chat_id"], f"Не получилось: {e}")
+        await bot.send_message(s["chat_id"], f"Не получилось: {err_text(e)}")
 
 
 async def process(bot, user_id, s):
@@ -252,6 +313,7 @@ async def process(bot, user_id, s):
         await api("POST", "submit", {
             "role": s["role"], "otherQs": s["other_qs"], "number": s["number"],
             "exp": s["exp"], "transcript": transcript,
+            "roleTitle": s["role_title"] if s["role"] == "other" else "",
         })
         sessions.pop(user_id, None)
         await bot.send_message(s["chat_id"], f"Голос #{s['number']} готов, открой вкладку «Голос» в приложении PostBot.")
@@ -259,6 +321,6 @@ async def process(bot, user_id, s):
         s["busy"] = False
         logger.exception("voice process failed")
         await bot.send_message(
-            s["chat_id"], f"Не получилось: {str(e)[:400]}\n\nСессия сохранена, нажми «Готово» еще раз.",
+            s["chat_id"], f"Не получилось: {err_text(e)[:400]}\n\nСессия сохранена, нажми «Готово» еще раз.",
             reply_markup=kb([[DONE_BTN, CANCEL_BTN]]),
         )
