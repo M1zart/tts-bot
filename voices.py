@@ -84,7 +84,8 @@ def select_name(title: str) -> str:
 
 
 EXP_RE = re.compile(
-    r"((?:более|больше|свыше|over|more than)?\s*\d+\s*\+?\s*(?:лет|года|год|годов|years?|yrs?)\b[^,;\n]*)", re.I)
+    r"((?:более|больше|свыше|over|more than)?\s*\d+\s*\+?\s*(?:лет|года|год|годов|years?|yrs?)\b[^,;\n]*|\b\d+\s*\+)", re.I)
+TAIL_NUM_RE = re.compile(r"\s(\d{1,2})\s*$")
 NUM_RE = re.compile(r"[#№]\s*(\d{1,4})")
 
 
@@ -101,6 +102,11 @@ def parse_hero(text: str):
     if m:
         exp = m.group(1).strip(" .,-—–")
         text = (text[:m.start()] + " " + text[m.end():])
+    if not exp:
+        m = TAIL_NUM_RE.search(text)
+        if m:
+            exp = m.group(1) + " лет"
+            text = text[:m.start()]
     role = re.sub(r"\s+", " ", text).strip(" ,;-—–.\n")
     role = re.sub(r"\b(стаж|опыт)\s*[:\-]?$", "", role, flags=re.I).strip(" ,;-—–.")
     return role, exp[:80], number
@@ -163,6 +169,8 @@ async def ask_ready(bot, s):
     exp = f", {s['exp']}" if s["exp"] else ""
     k = role_count(s) + 1
     note = "Первый голос этой роли." if k == 1 else f"Это {nth(k)} голос этой роли, до него уже {k - 1}."
+    if s["role"] == "other":
+        note += " Роли нет в списке: вопросы по роли бот восстановит из ответов."
     await bot.send_message(
         s["chat_id"],
         f"Голос #{s['number']}: {role_title(s)}{exp}\n{note}\nГолосовых: {len(s['voices'])}. "
@@ -172,37 +180,17 @@ async def ask_ready(bot, s):
 
 
 async def after_role(bot, s):
-    """Роль определена: для известной роли сразу к подтверждению, для новой просим вопросы."""
-    if s["role"] == "other":
-        s["step"] = "otherq"
-        need = int((s.get("info") or {}).get("roleQuestions", 3))
-        await bot.send_message(
-            s["chat_id"],
-            f"Такой роли нет в списке: «{role_title(s)}». Пришли {need} вопроса для нее одним сообщением, "
-            f"каждый с новой строки. Первые два общих вопроса добавятся сами.",
-            reply_markup=kb([[CANCEL_BTN]]),
-        )
-        return
+    """Роль определена. Для роли вне списка вопросы не нужны: PostBot восстановит их из самих ответов."""
     await ask_ready(bot, s)
 
 
 async def handle_session_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Текст в чате, пока открыта сессия: роль и стаж или вопросы для новой роли. True = текст использован."""
     s = sessions.get(update.effective_user.id)
-    if not s or s["busy"] or s["step"] not in ("role", "ready", "pick", "otherq"):
+    if not s or s["busy"] or s["step"] not in ("role", "ready", "pick"):
         return False
     text = (update.message.text or "").strip()
     bot = context.bot
-    if s["step"] == "otherq":
-        need = int((s.get("info") or {}).get("roleQuestions", 3))
-        qs = [q.strip().lstrip("0123456789.) ").strip() for q in text.split("\n")]
-        qs = [q for q in qs if q]
-        if len(qs) != need:
-            await update.message.reply_text(f"Нужно ровно {need} вопроса, каждый с новой строки.")
-            return True
-        s["other_qs"] = qs
-        await ask_ready(bot, s)
-        return True
     # role / ready / pick: считаем, что человек пишет роль и стаж (заново тоже можно)
     if not s.get("info"):
         try:
